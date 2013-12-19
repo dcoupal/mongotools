@@ -76,7 +76,7 @@ def dump_database(host, port, directory, mongodump):
     print "Dumping database...",
     cmd = "%s --host %s --port %s" % (mongodump, host, port)
     if directory != ".":
-        cmd = "cd %s & %s" % (directory, cmd)
+        cmd = "cd %s && %s" % (directory, cmd)
     run_cmd(cmd, abort=True)
     print " done."
     

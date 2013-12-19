@@ -95,7 +95,7 @@ def find_paths(deps):
 def restore_database(host, port, directory, mongorestore):
     print "Restoring database...",
     cmd = "%s --host %s --port %s" % (mongorestore, host, port)
-    cmd = "cd %s & %s" % (directory, cmd)
+    cmd = "cd %s && %s" % (directory, cmd)
     run_cmd(cmd, abort=True)
     print " done."
     
@@ -112,7 +112,7 @@ def main():
         print "Running Python version %s" % (sys.version)
     try:
         paths = find_paths(DEPS)
-        dump_dir = os.path.join(options.directory, PID)
+        dump_dir = os.path.join(options.directory, str(PID))
         if os.path.exists(dump_dir):
             warning("Had to remove previously left over temp dir: %s" % (dump_dir))
         if not os.path.exists(options.file):
@@ -151,6 +151,8 @@ def run_cmd(cmd, array=True, abort=False):
     :param cmd: command to run
     :param array: return result as array. 'True' is the default
     '''
+    if Verbose:
+        print "Running cmd: %s" % (cmd)
     (status, out) = commands.getstatusoutput(cmd)
     if status:
         if abort:
