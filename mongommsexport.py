@@ -34,6 +34,7 @@ import commands
 import optparse
 import os
 import sys
+import shutil
 import tarfile
 
 TOOL = "mongommsexport"
@@ -41,6 +42,8 @@ VERSION = "0.1.0"
 
 DEPS = [ "mongo", "mongodump" ]
 DUMPDIR = "dump"
+
+BSON_TO_REMOVE = ["mmsdbconfig/config.alertSettings", "mmsdbconfig/config.users"]
 
 Errors = 0
 Verbose = False
@@ -68,6 +71,9 @@ def clean_data(directory, deep_clean):
         data_dir = os.path.join(directory, DUMPDIR)
     else:
         data_dir = os.path.join('.', DUMPDIR)
+    for one_dir in BSON_TO_REMOVE:
+        dir_to_rm = os.path.join(directory, one_dir + ".bson")
+        os.remove(dir_to_rm)
     if deep_clean:
         fatal("Cleaning the data is not implemented yet, you need to do it manually.\n" +
               "Files are in %s" % (data_dir))
@@ -145,7 +151,7 @@ def main():
         if space_avail < space_needed:
             print "Database is %d MBytes, there is only %s MBytes available on disk" % (space_needed/1000, space_avail/1000)
         dump_database(options.host, options.port, options.directory, paths['mongodump'])
-        clean_data(options.directory, options.clean)
+        clean_data(dump_dir, options.clean)
         if options.ship:
             package_and_ship(options.directory, options.ship)
             

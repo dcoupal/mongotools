@@ -28,6 +28,7 @@ Implementation details:
 import commands
 import optparse
 import os
+import pymongo
 import shutil
 import sys
 import tarfile
@@ -38,6 +39,8 @@ VERSION = "0.1.0"
 DEPS = [ "mongo", "mongorestore" ]
 DUMPDIR = "dump"
 PID = os.getpid()
+
+DB_CLOUDCONF = "cloudconf"
 
 Errors = 0
 Verbose = False
@@ -61,7 +64,10 @@ def get_opts():
 def clean_data(directory):
     # TODO
     # Remove the MMS config data
-    pass
+    col_dir = os.path.join(directory, DUMPDIR, DB_CLOUDCONF)
+    shutil.rmtree(col_dir)
+    col_dir = os.path.join(directory, DUMPDIR, DB_CLOUDCONF)
+    shutil.rmtree(col_dir)
 
 def explode_gzip(gzipfile, target_dir):
     print "Exploding gzip file...",
@@ -94,11 +100,19 @@ def find_paths(deps):
     
 def restore_database(host, port, directory, mongorestore):
     print "Restoring database...",
-    cmd = "%s --host %s --port %s" % (mongorestore, host, port)
+    cmd = "%s --host %s --port %s --verbose" % (mongorestore, host, port)
     cmd = "cd %s && %s" % (directory, cmd)
     run_cmd(cmd, abort=True)
     print " done."
     
+def set_defaults(host, port):
+    int_port = int(port)
+    client = pymongo.mongo_client.MongoClient(host=host, port=int_port)
+    db = client[DB_CLOUDCONF]
+    coll = db['app.systemCronState']
+    coll.update({},{"$set":{"enabled":False}}, upsert=False, multi=True)
+    pass
+
 def main():
     global Verbose
     sys.stdout = flushfile(sys.stdout)
@@ -122,6 +136,7 @@ def main():
             fatal("Can't find the dump directory to restore from: %s" % (dump_dir))
         clean_data(dump_dir)
         restore_database(options.host, options.port, dump_dir, paths['mongorestore'])
+        set_defaults(options.host, options.port)
         # Clean the dump tree
         shutil.rmtree(dump_dir)
             
@@ -154,6 +169,8 @@ def run_cmd(cmd, array=True, abort=False):
     if Verbose:
         print "Running cmd: %s" % (cmd)
     (status, out) = commands.getstatusoutput(cmd)
+    if Verbose:
+        print out
     if status:
         if abort:
             raise Exception("ERROR in running - " + cmd)
