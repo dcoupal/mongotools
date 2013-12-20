@@ -41,6 +41,7 @@ DUMPDIR = "dump"
 PID = os.getpid()
 
 DB_CLOUDCONF = "cloudconf"
+DB_MMSCONF = "mmsdbconfig"
 
 Errors = 0
 Verbose = False
@@ -108,10 +109,14 @@ def restore_database(host, port, directory, mongorestore):
 def set_defaults(host, port):
     int_port = int(port)
     client = pymongo.mongo_client.MongoClient(host=host, port=int_port)
+    # Ensure all aggregations, alerts, ... are turned off
     db = client[DB_CLOUDCONF]
     coll = db['app.systemCronState']
     coll.update({},{"$set":{"enabled":False}}, upsert=False, multi=True)
-    pass
+    # All our internal users should have access to all groups
+    db = client[DB_MMSCONF]
+    coll = db['config.users']
+    coll.update({"pe":{"$regex":"mongodb\.com"}}, {"$addToSet":{"roles": {"role":"XGEN_USER"}}})
 
 def main():
     global Verbose
@@ -126,19 +131,20 @@ def main():
         print "Running Python version %s" % (sys.version)
     try:
         paths = find_paths(DEPS)
-        dump_dir = os.path.join(options.directory, str(PID))
-        if os.path.exists(dump_dir):
-            warning("Had to remove previously left over temp dir: %s" % (dump_dir))
-        if not os.path.exists(options.file):
-            fatal("Can't find gzip file to import: %s" % (options.file))
-        explode_gzip(options.file, dump_dir)
-        if not os.path.exists(dump_dir):
-            fatal("Can't find the dump directory to restore from: %s" % (dump_dir))
-        clean_data(dump_dir)
-        restore_database(options.host, options.port, dump_dir, paths['mongorestore'])
+        if options.file:
+            dump_dir = os.path.join(options.directory, str(PID))
+            if os.path.exists(dump_dir):
+                warning("Had to remove previously left over temp dir: %s" % (dump_dir))
+            if not os.path.exists(options.file):
+                fatal("Can't find gzip file to import: %s" % (options.file))
+            explode_gzip(options.file, dump_dir)
+            if not os.path.exists(dump_dir):
+                fatal("Can't find the dump directory to restore from: %s" % (dump_dir))
+            clean_data(dump_dir)
+            restore_database(options.host, options.port, dump_dir, paths['mongorestore'])
+            # Clean the dump tree
+            shutil.rmtree(dump_dir)
         set_defaults(options.host, options.port)
-        # Clean the dump tree
-        shutil.rmtree(dump_dir)
             
     except Exception, e:
         error("caught exception:\n  " + e.__str__())
