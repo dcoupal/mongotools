@@ -1,26 +1,23 @@
-#!/usr/bin/env python2.7
+#!/usr/bin/python
 
 '''
-Created on Dec 17, 2013
+Created in January 2014
 
 @author: Daniel Coupal
 
 Script to export an MMS instance.
   - it connects to the MMS host
   - calculates the size of the data to dump and ensure we have enough space
-  - dump all data with 'mongodump'
+  - dump all data with 'mongodump' and 'mongoexport'
   - parse the data to remove some potential sensitive data
   - tar the resulting file
-  - copy the resulting file on our FTP server
+  - scp the resulting file in the MongoDB dropbox
 
 Pre-requisites:
   - Python < 2.3 and > 3.0
   - user must have 'mongo' and 'mongodump' in path, or set MONGO_HOME
 
 Implementation details:
-  - The --clean option should
-    - remove users, or at least remove user names from email addresses
-    - remove alerts
   - The script should not 'rm' anything, instead it will tell the user to
     remove things in the way
   - we try to avoid using 'pymongo', prefering doing things in little more
@@ -32,7 +29,6 @@ Implementation details:
  TODOs
   - calculate DB and disk space
   - better check on the disk needs
-  - implement '-norun'
   - because we are running 'mongodump', we don't have control on the DBs we
     are exporting. If users have more than MMS in the DB, we may export way 
     too much. Then we would need to export with 'mongoexport'
@@ -49,22 +45,28 @@ import tarfile
 TOOL = "mongommsexport"
 VERSION = "0.1.0"
 
-MMS_3_0_MIG_RULE = "CreateUserRolesPhase1"  # This is one of the 10 rules for the 2.0->3.0 migration
-MMS_2_0_MIG_RULE = "SplitRrdMinuteCollections"
-
 COLLECTIONS_DIR = "_collections"
+DB_CLOUDCONF = "cloudconf"
+DB_MMSCONF = "mmsdbconfig"
 DEPS = ("mongo", "mongodump", "mongoexport")
 DUMPDIR = "dump"
 FTP_PREFIX = "MMS-"
+MMS_VERSION_FILE = "mms_version"
 NUL_DOMAIN = "example.com"
 
-FILES_TO_REMOVE = ["cloudconf/app.migrations.bson",
+FILES_TO_REMOVE = [
+                   "cloudconf/app.migrations.bson",
                    "mmsdb/data.emails.bson",
                    "mmsdbconfig/config.alertSettings.bson",
                    "mmsdbconfig/config.customers.bson",
-#                   "mmsdbconfig/config.users.bson"    # FIXME, if we remove users, we have problems giving access to the group, because the main user authorize the access.
+                   "mmsdbconfig/config.users.bson"
                    ]
-COLLECTIONS_TO_EXPORT = [ ("mmsdbconfig", "config.customers") ]
+COLLECTIONS_TO_EXPORT = [ ("cloudconf", "app.migrations"), ("mmsdbconfig", "config.customers")  ]
+
+ALL_MMS_DBS = [ "cloudconf", "mmsdbconfig" ]
+
+# OS - specific?
+HOSTS_FILE = "/etc/hosts"
 
 Errors = 0
 Verbose = False
@@ -83,13 +85,12 @@ def get_opts():
     group_general.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False, help="show more output")
     group_security = optparse.OptionGroup(parser, "Security options")
     parser.add_option_group(group_security)
-    group_security.add_option("-c", "--clean", dest="clean", action="store_true", default=False, help="remove proprietary information")
-    group_security.add_option("-n", "--norun", dest="norun", action="store_true", default=False, help="don't run, just show what would be run")
     group_security.add_option("-s", "--ship", dest="ship", type="int", default=0, help="ship the data under the given case ID number, for example 12345 for the case ID ec-12345", metavar="nnnnn")
+    group_security.add_option("-z", "--zip", dest="zip", action="store_true", default=False, help="zip the data, but do not ship it")
     (options, args) = parser.parse_args()
     return options, args
 
-def clean_dumped_data(directory, deep_clean):
+def clean_dumped_data(directory):
     '''
     Remove some directories and files from the "dump" directory.
     Those paths are mostly info the customer does not want to send, or data we
@@ -97,27 +98,19 @@ def clean_dumped_data(directory, deep_clean):
     settings could overwrite the data in the instance. In general any
     data that is shared by many MMS instances should not be loaded.
     :param directory: where the "dump" dir is located
-    :param deep_clean: Not Implemented, but would do more obfuscation, ...
     '''
     print "Removing sensitive information like user, emails, ..."
-    if directory:
-        data_dir = os.path.join(directory, DUMPDIR)
-    else:
-        data_dir = os.path.join('.', DUMPDIR)
     for one_file in FILES_TO_REMOVE:
         file_to_rm = os.path.join(directory, one_file)
         os.remove(file_to_rm)
-    if deep_clean:
-        fatal("Cleaning the data is not implemented yet, you need to do it manually.\n" +
-              "Files are in %s" % (data_dir))
 
-def dump_database(host, port, directory, mongodump):
+def dump_database(mongodump, host, port, directory, ):
     '''
     Dump the database with "mongodump".
+    :param mongodump: path to the executable mongodump.
     :param host: host where the source MMS instance is. Default to localhost.
     :param port: port to access the database. Default to 27017.
     :param directory: directory where to dump to database.
-    :param mongodump: path to the executable mongodump.
     '''
     print "Dumping database...",
     cmd = "%s --host %s --port %s" % (mongodump, host, port)
@@ -126,24 +119,28 @@ def dump_database(host, port, directory, mongodump):
     run_cmd(cmd, abort=True)
     print " done."
     
-def export_additional_data(mongoexport, dump_dir, caseid):
+def export_additional_data(mongoexport, host, port, dump_dir, caseid):
     '''
     Export additional data.
     Add "text" version of some collections, to make it easier for the
     customer to review the sensitive data.
     Also, add some documents to identify this database once imported.
     :param mongoexport: path to "mongoexport".
+    :param host: host where the source MMS instance is. Default to localhost.
+    :param port: port to access the database. Default to 27017.
     :param dump_dir: dump directory in which the additional data will be added.
+    :param caseid: used to prefix the groups, so we don't have collisions in
+                   the receiving database.
     '''
     print "Exporting additional collections"
     for db_coll in COLLECTIONS_TO_EXPORT:
         (db, coll) = db_coll
         json_file = os.path.join(dump_dir, COLLECTIONS_DIR, db, coll)
-        cmd = "%s -d %s -c %s -o %s" % (mongoexport, db, coll, json_file)
+        cmd = "%s --host %s --port %s -d %s -c %s -o %s" % (mongoexport, host, port, db, coll, json_file)
         run_cmd(cmd)
+        # Modify the customer group names, so they have the case ID as a prefix
         if db == "mmsdbconfig" and coll == "config.customers":
             replace_string(json_file, '"n" : "', '"n" : "%i-' % (caseid))
-    # Modify the customer group names, so they have the case ID as a prefix
     
 def find_paths(deps):
     '''
@@ -197,62 +194,88 @@ def get_mms_version(dump_dir):
     Identify the MMS version.
     Because we may not be on the MMS server itself, we don't have access to
     the MMS binaries.
-    So, the way to identify the version is to look at the data format in the
-    database.
     Currently, we are looking at the migrations run by MMS. Each version of
     MMS is running migrations between its versions, at least up to now.
-    TOFIX - If a new version does not do migrations, this algorithm will be
+    FIXME - If a new version does not do migrations, this algorithm will be
     broken.
-    :param dump_dir:
+    :param dump_dir: root dir from which we find the collections used to
+                     deduce the version number.
     '''
     # Use the migration rules on the DB to figure out the version
     # Every new MMS version changes a little the schema, and we add rules that are
     # cumulative to update the schema, so we use the fact that those rules were run
     # to figure out the version
-    # FIXME, just don't look for a specific migration, count them, so it is upward
-    # compatible.
     version = "1.0"
-    migration_file = "cloudconf/app.migrations.bson"
-    (ret, _) = run_cmd("grep '%s' %s/%s" % (MMS_3_0_MIG_RULE, dump_dir, migration_file))
+    migration_file = os.path.join(dump_dir, COLLECTIONS_DIR, "cloudconf", "app.migrations")
+    (ret, out) = run_cmd("wc -l %s" % (migration_file), array=False)
     if not ret:
-        version = "1.3"
-    (ret, _) = run_cmd("grep '%s' %s/%s" % (MMS_2_0_MIG_RULE, dump_dir, migration_file))
-    if not ret:
-        version = "1.2"
+        items = out.split()
+        count = items[0]
+        if count == '0':
+            version = "1.1"
+        elif count == '1':
+            version = "1.2"
+        elif count == '11':
+            version = "1.3"
+        else:
+            # For version we don't know yet
+            version = count
     if Verbose:
         print "MMS version is %s" % (version)
     return version
     
 
-def package_and_ship(directory, caseid):
+def package(directory, zipname):
     '''
-    Create a Zip file of the data and send it to the FTP site.
-    FIXME: still have issue in doing the 'scp' because the remote site is
-           asking for a password, even if it is blank.
+    Create a Zip file of the data.
     :param directory: directory to Zip
-    :param caseid: CS-xxxxx case the customer has open with us.
-                   We use that case number as the user for the scp.
+    :param zipname: CS-xxxxx case the customer has open with us in case
+                    the file is shipped, otherwise 'mongo_mms_data'.
     '''
     print "Packaging...",
-    target = os.path.join(directory, str(caseid) + ".gzip")
+    target = os.path.join(directory, zipname + ".gzip")
     tar = tarfile.open(target, "w:gz")
     tar.add(os.path.join(directory, DUMPDIR))    
     tar.close()
     print " done."
-    print "Preparing to upload to MongoDB Inc"
-    print "  *** You will be prompted to enter a password, just press <enter> ***"
-    print ""
-    cmd = 'scp -o "StrictHostKeyChecking no" -P 722 %s %s%d@www.mongodb.com:.' % (target, FTP_PREFIX, caseid)
-    run_cmd(cmd, abort=True)
-    os.remove(target)
-    print " done."
+    return target
     
 def replace_string(filename, search_exp, replace_exp):
+    '''
+    Utility to replace a string in a file.
+    :param filename: file to modify
+    :param search_exp: string to be replaced
+    :param replace_exp: replacement string
+    '''
     for line in fileinput.input(filename, inplace=1):
         if search_exp in line:
             line = line.replace(search_exp, replace_exp)
         sys.stdout.write(line)
 
+def ship(zipfile, caseid):
+    '''
+    scp the zip file to the MongoDB DropBox
+    :param zipfile: name of the file to ship
+    :param caseid: caseid under which it will be copied in DropBox
+    '''
+    print "Preparing to upload to MongoDB Inc"
+    print "  *** You will be prompted to enter a password, just press <enter> ***"
+    print ""
+    cmd = 'scp -o "StrictHostKeyChecking no" -P 722 %s %s%d@www.mongodb.com:.' % (zipfile, FTP_PREFIX, caseid)
+    run_cmd(cmd, abort=True)
+    os.remove(zipfile)
+    print " done."
+    
+def write_mms_version(dump_dir):
+    '''
+    Write the MMS version in a file, so the importer knows how to import the data.
+    :param dump_dir: dir under which the version file is saved.
+    '''
+    mms_version = get_mms_version(dump_dir)
+    ver_file = open(os.path.join(dump_dir, MMS_VERSION_FILE),'w')
+    ver_file.write(mms_version)
+    ver_file.close()
+    
 def main():
     '''
     The main module.
@@ -268,6 +291,7 @@ def main():
         print "%s version %s" % (TOOL, VERSION)
         print "Running Python version %s" % (sys.version)
     try:
+        options.host = get_host(options.host)
         dump_dir = os.path.join(options.directory, DUMPDIR)
         if os.path.exists(dump_dir):
             if options.force:
@@ -280,35 +304,65 @@ def main():
         # TODO - need a better formula, since we have the 'dump' dir and the 'gzip' files to create
         if space_avail < space_needed:
             print "Database is %d MBytes, there is only %s MBytes available on disk" % (space_needed/1000, space_avail/1000)
-        dump_database(options.host, options.port, options.directory, paths['mongodump'])
-        mms_version = get_mms_version(dump_dir)
-        clean_dumped_data(dump_dir, options.clean)
-        export_additional_data(paths['mongoexport'], dump_dir, options.ship)
+        dump_database(paths['mongodump'], options.host, options.port, options.directory)
+        clean_dumped_data(dump_dir)
+        export_additional_data(paths['mongoexport'], options.host, options.port, dump_dir, options.ship)
+        write_mms_version(dump_dir)
 
         if options.ship:
-            package_and_ship(options.directory, options.ship)
+            zipfile = package(options.directory, str(options.ship))
+            ship(zipfile, options.ship)
+        elif options.zip:
+            zipfile = package(options.directory, 'mongodb_mms_data')
             
     except Exception, e:
         error("caught exception:\n  " + e.__str__())
     
 # Common functions
 # Those are shared with 'mongommsimport', so changes here should be done
-# in the other script.
+# tested in the other script.
 def error(mes):
+    '''
+    Print an error message, and count the errors
+    :param mes: message to print
+    '''
     global Errors
     Errors += 1
     print "ERROR - %s" % (mes)
     return
 
 def fatal(mes):
+    '''
+    Print a fatal message and exit
+    :param mes: message to print
+    '''
     global Errors
     Errors += 1
     print "FATAL - %s" % (mes)
     os.sys.exit(100)
 
 def warning(mes):
+    '''
+    Print a warning
+    :param mes: message to print
+    '''
     print "WARNING - %s" % (mes)
     return
+
+def get_host(hostname):
+    '''
+    Utility function to look into your local hosts file to see
+    if you want to use an alias for the host.
+    :param hostname:
+    '''
+    if os.path.exists(HOSTS_FILE):
+        hosts_file = open(HOSTS_FILE, "r" )
+        for line in hosts_file:    
+            items = line.split()
+            if len(items) >= 2 and items[0] == hostname:
+                hostname = items[1]
+                break    
+    return hostname
 
 def run_cmd(cmd, array=True, abort=False):
     '''
@@ -328,6 +382,9 @@ def run_cmd(cmd, array=True, abort=False):
 
 # Utility classes
 class flushfile(object):
+    '''
+    Class to flush STDOUT and STDERR
+    '''
     def __init__(self, f):
         self.f = f
 
@@ -337,7 +394,7 @@ class flushfile(object):
 
 if __name__ == '__main__':
     main()
-    pass
+
 
 
 
