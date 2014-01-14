@@ -18,7 +18,9 @@ Pre-requisites:
   - user must have 'mongo', 'mongoexport' and 'mongodump' in path, or set MONGO_HOME
 
 Implementation details:
-  - 
+  - A lot of the functions are imported from 'mongommsexport.py' instead of being shared
+    in a common file. The reason was to be able to give a single stand alone file to the
+    customers, so it is also used as the library for the common functions.
 
  TODOs
   - Add a security check, so the customers don't run this tool by mistake and import
@@ -35,7 +37,7 @@ import tarfile
 
 ROOTDIR = os.path.dirname(__file__)
 sys.path.insert(0, ROOTDIR)
-from mongommsexport import flushfile, error, fatal, warning, find_paths, get_host, run_cmd, COLLECTIONS_DIR, DB_CLOUDCONF, DB_MMSCONF, DUMPDIR, MMS_VERSION_FILE
+import mongommsexport
 
 TOOL = "mongommsimport"
 VERSION = "0.1.0"
@@ -43,9 +45,9 @@ VERSION = "0.1.0"
 DEPS = [ "mongo", "mongoimport", "mongorestore" ]
 PID = os.getpid()
 
-COLLECTIONS_TO_IMPORT = [ ("mmsdbconfig", "config.customers") ] # IMPROVE, find all collections by looking at dir, except ("cloudconf", "app.migrations")
+COLLECTIONS_TO_IMPORT = [ ("mmsdbconfig", "config.customers"),
+                          ("importer", "exports") ] # IMPROVE, find all collections by looking at dir, except ("cloudconf", "app.migrations")
 
-Errors = 0
 Verbose = False
 
 def get_opts():
@@ -72,7 +74,7 @@ def clean_data(directory):
     Remove the MMS config data
     :param directory: root dir from which we do the cleaning
     '''
-    col_dir = os.path.join(directory, DB_CLOUDCONF)
+    col_dir = os.path.join(directory, mongommsexport.DB_CLOUDCONF)
     if os.path.exists(col_dir):
         shutil.rmtree(col_dir)
 
@@ -94,7 +96,7 @@ def get_data_mms_version(directory):
     :param directory: directory of the data to import
     '''
     version = None
-    version_path = os.path.join(directory, MMS_VERSION_FILE)
+    version_path = os.path.join(directory, mongommsexport.MMS_VERSION_FILE)
     if os.path.isfile(version_path):
         version_file = open(version_path, 'r')
         version = version_file.read().strip()
@@ -113,8 +115,8 @@ def get_mms_version(host, port):
     # Ensure all aggregations, alerts, ... settings are turned off
     coll = 'app.migrations'
     if Verbose:
-        print "Counting documents in DB:%s COLL:%s" % (DB_CLOUDCONF, coll)
-    db = client[DB_CLOUDCONF]
+        print "Counting documents in DB:%s COLL:%s" % (mongommsexport.DB_CLOUDCONF, coll)
+    db = client[mongommsexport.DB_CLOUDCONF]
     coll = db[coll]
     count = coll.count()
     if count == 1:
@@ -142,17 +144,17 @@ def restore_database(host, port, directory, mongorestore, mongoimport, upsert):
     print "  First, the 'dump' part..."
     cmd = "%s --host %s --port %s --verbose" % (mongorestore, host, port)
     cmd = "cd %s && %s" % (directory, cmd)
-    run_cmd(cmd, abort=True)
+    mongommsexport.run_cmd(cmd, abort=True)
     print "  Secondly, the exported collections..."
     for db_coll in COLLECTIONS_TO_IMPORT:
         (db, coll) = db_coll
-        json_file = os.path.join(directory, DUMPDIR, COLLECTIONS_DIR, db, coll)
+        json_file = os.path.join(directory, mongommsexport.DUMPDIR, mongommsexport.COLLECTIONS_DIR, db, coll)
         cmd = "%s --host %s --port %s -d %s -c %s --file %s" % (mongoimport, host, port, db, coll, json_file)
         if upsert:
             cmd = cmd + " --upsert"
-        run_cmd(cmd)
+        mongommsexport.run_cmd(cmd, abort=True)
     
-    print " done."
+    print "  done."
   
 def set_defaults(host, port, mms_version):
     '''
@@ -170,22 +172,22 @@ def set_defaults(host, port, mms_version):
     # Ensure all aggregations, alerts, ... settings are turned off
     coll = 'app.systemCronState'
     if Verbose:
-        print "Modifying DB:%s COLL:%s" % (DB_CLOUDCONF, coll)
-    db = client[DB_CLOUDCONF]
+        print "Modifying DB:%s COLL:%s" % (mongommsexport.DB_CLOUDCONF, coll)
+    db = client[mongommsexport.DB_CLOUDCONF]
     coll = db[coll]
     coll.update({},{"$set":{"enabled":False}}, upsert=False, multi=True)
     # Ensure specific alerts are turned off
     coll = 'config.alertSettings'
     if Verbose:
-        print "Modifying DB:%s COLL:%s" % (DB_MMSCONF, coll)
-    db = client[DB_MMSCONF]
+        print "Modifying DB:%s COLL:%s" % (mongommsexport.DB_MMSCONF, coll)
+    db = client[mongommsexport.DB_MMSCONF]
     coll = db[coll]
     coll.update({},{"$set":{"enabled":False}}, upsert=False, multi=True)
     # All our internal users should have access to all groups
     coll = 'config.users'
     if Verbose:
-        print "Modifying DB:%s COLL:%s" % (DB_MMSCONF, coll)
-    db = client[DB_MMSCONF]
+        print "Modifying DB:%s COLL:%s" % (mongommsexport.DB_MMSCONF, coll)
+    db = client[mongommsexport.DB_MMSCONF]
     coll = db[coll]
     if mms_version >= "1.3":
         coll.update({"pe":{"$regex":"mongodb.com"}}, {"$addToSet":{"roles": {"role":"XGEN_USER"}}}, upsert=False, multi=True)
@@ -199,39 +201,40 @@ def main():
     The main module.
     '''
     global Verbose
-    sys.stdout = flushfile(sys.stdout)
+    sys.stdout = mongommsexport.flushfile(sys.stdout)
     (options, args) = get_opts()
     if args:
-        fatal("Found trailing arguments: %s" % (str(args)))
+        mongommsexport.fatal("Found trailing arguments: %s" % (str(args)))
     if options.verbose:
         Verbose = True
+        mongommsexport.Verbose = True
         print "Verbose mode on, will show more info..."
         print "%s version %s" % (TOOL, VERSION)
         print "Running Python version %s" % (sys.version)
     try:
-        options.host = get_host(options.host)
-        paths = find_paths(DEPS)
+        options.host = mongommsexport.get_host(options.host)
+        paths = mongommsexport.find_paths(DEPS)
         mms_version = get_mms_version(options.host, options.port)
         if options.data:
             need_rm_extract_dir = False
             if not os.path.exists(options.data):
-                fatal("Can't find gzip file or directory to import: %s" % (options.data))
+                mongommsexport.fatal("Can't find gzip file or directory to import: %s" % (options.data))
             if os.path.isfile(options.data):
                 extract_dir = os.path.join(options.tmpdir, str(PID))
                 if os.path.exists(extract_dir):
-                    warning("Remove previously left over temp dir: %s" % (extract_dir))
+                    mongommsexport.warning("Remove previously left over temp dir: %s" % (extract_dir))
                     shutil.rmtree(extract_dir)
                     need_rm_extract_dir = True
                 explode_gzip(options.data, extract_dir)
             elif os.path.isdir(options.data):
                 # Assume the format and contents is already right
                 extract_dir = options.data
-            dump_dir = os.path.join(extract_dir, DUMPDIR)
+            dump_dir = os.path.join(extract_dir, mongommsexport.DUMPDIR)
             if not os.path.exists(dump_dir):
-                fatal("Can't find the dump directory to restore: %s" % (dump_dir))
+                mongommsexport.fatal("Can't find the dump directory to restore: %s" % (dump_dir))
             data_mms_version = get_data_mms_version(dump_dir)
             if data_mms_version != mms_version:
-                fatal("Can't import MMS data in version %s into a MMS server version %s" % (data_mms_version, mms_version))
+                mongommsexport.fatal("Can't import MMS data in version %s into a MMS server version %s" % (data_mms_version, mms_version))
             clean_data(dump_dir)
             restore_database(options.host, options.port, extract_dir, paths['mongorestore'], paths['mongoimport'], options.upsert)
             # Clean the dump tree
@@ -242,7 +245,7 @@ def main():
         set_defaults(options.host, options.port, mms_version)
             
     except Exception, e:
-        error("caught exception:\n  " + e.__str__())
+        mongommsexport.error("caught exception:\n  " + e.__str__())
     
 if __name__ == '__main__':
     main()

@@ -27,8 +27,6 @@ Implementation details:
     agent in Python will be replaced by a Go version.
     
  TODOs
-  - calculate DB and disk space
-  - better check on the disk needs
   - because we are running 'mongodump', we don't have control on the DBs we
     are exporting. If users have more than MMS in the DB, we may export way 
     too much. Then we would need to export with 'mongoexport'
@@ -36,11 +34,15 @@ Implementation details:
 
 import commands
 import fileinput
+import glob
 import optparse
 import os
+import re
 import shutil
+import socket
 import sys
 import tarfile
+import time
 
 TOOL = "mongommsexport"
 VERSION = "0.1.0"
@@ -51,6 +53,7 @@ DB_MMSCONF = "mmsdbconfig"
 DEPS = ("mongo", "mongodump", "mongoexport")
 DUMPDIR = "dump"
 FTP_PREFIX = "MMS-"
+IMPORTER_DB = "importer"
 MMS_VERSION_FILE = "mms_version"
 NUL_DOMAIN = "example.com"
 
@@ -59,16 +62,20 @@ FILES_TO_REMOVE = [
                    "mmsdb/data.emails.bson",
                    "mmsdbconfig/config.alertSettings.bson",
                    "mmsdbconfig/config.customers.bson",
-                   "mmsdbconfig/config.users.bson"
+                   "mmsdbconfig/config.users.bson",
+                   "mmsdblogs-*/*"
                    ]
 COLLECTIONS_TO_EXPORT = [ ("cloudconf", "app.migrations"), ("mmsdbconfig", "config.customers")  ]
 
-ALL_MMS_DBS = [ "cloudconf", "mmsdbconfig" ]
+MAX_UNEXPECTED_DBS = 0
+ALL_MMS_DBS = [ r"^apiv3$", r"^alerts$", r"^cloudconf$", r"^mmsdb.*", r"^mongo-distributed-lock$" ]
+NOT_MMS_DBS = [ r"^config$", r"^local$", r"^test$" ]
 
 # OS - specific?
 HOSTS_FILE = "/etc/hosts"
 
 Errors = 0
+Norun = False
 Verbose = False
 
 def get_opts():
@@ -78,6 +85,7 @@ def get_opts():
     parser = optparse.OptionParser(version="%prog " + VERSION)
     group_general = optparse.OptionGroup(parser, "General options")
     parser.add_option_group(group_general)
+    group_general.add_option("-c", "--caseid", dest="caseid", type="string", default="", help="caseid/ticket to associate the data with, for example 12345 for the case ID ec-12345", metavar="CASEID")    
     group_general.add_option("-d", "--directory", dest="directory", type="string", default=".", help="directory where to put the tar file", metavar="DIR")
     group_general.add_option("-f", "--force", dest="force", action="store_true", default=False, help="force removal of a previous 'dump' directory")
     group_general.add_option("--host", dest="host", type="string", default='localhost', help="host name of the MMS server", metavar="HOST")
@@ -85,7 +93,9 @@ def get_opts():
     group_general.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False, help="show more output")
     group_security = optparse.OptionGroup(parser, "Security options")
     parser.add_option_group(group_security)
-    group_security.add_option("-s", "--ship", dest="ship", type="int", default=0, help="ship the data under the given case ID number, for example 12345 for the case ID ec-12345", metavar="nnnnn")
+    group_security.add_option("--nocheck", dest="nocheck", action="store_true", default=False, help="don't run any check, you must ensure you have enough space, ...")
+    group_security.add_option("--norun", dest="norun", action="store_true", default=False, help="don't run any command, just show them")
+    group_security.add_option("-s", "--ship", dest="ship", action="store_true", default=False, help="ship the data under the given '-caseid' number")
     group_security.add_option("-z", "--zip", dest="zip", action="store_true", default=False, help="zip the data, but do not ship it")
     (options, args) = parser.parse_args()
     return options, args
@@ -100,11 +110,14 @@ def clean_dumped_data(directory):
     :param directory: where the "dump" dir is located
     '''
     print "Removing sensitive information like user, emails, ..."
-    for one_file in FILES_TO_REMOVE:
-        file_to_rm = os.path.join(directory, one_file)
-        os.remove(file_to_rm)
+    for one_glob in FILES_TO_REMOVE:
+        if not Norun:
+            for file_to_rm in glob.glob(os.path.join(directory, one_glob)):
+                if not os.path.exists(file_to_rm):
+                    fatal("That does not look like MMS database, missing collection: %s" % (file_to_rm))
+                os.remove(file_to_rm)
 
-def dump_database(mongodump, host, port, directory, ):
+def dump_database(mongodump, host, port, directory):
     '''
     Dump the database with "mongodump".
     :param mongodump: path to the executable mongodump.
@@ -116,8 +129,8 @@ def dump_database(mongodump, host, port, directory, ):
     cmd = "%s --host %s --port %s" % (mongodump, host, port)
     if directory != ".":
         cmd = "cd %s && %s" % (directory, cmd)
-    run_cmd(cmd, abort=True)
-    print " done."
+    run_cmd(cmd, abort=True, norun=Norun)
+    print "  done."
     
 def export_additional_data(mongoexport, host, port, dump_dir, caseid):
     '''
@@ -137,10 +150,11 @@ def export_additional_data(mongoexport, host, port, dump_dir, caseid):
         (db, coll) = db_coll
         json_file = os.path.join(dump_dir, COLLECTIONS_DIR, db, coll)
         cmd = "%s --host %s --port %s -d %s -c %s -o %s" % (mongoexport, host, port, db, coll, json_file)
-        run_cmd(cmd)
+        run_cmd(cmd, norun=Norun)
         # Modify the customer group names, so they have the case ID as a prefix
-        if db == "mmsdbconfig" and coll == "config.customers":
-            replace_string(json_file, '"n" : "', '"n" : "%i-' % (caseid))
+        if not Norun:
+            if db == "mmsdbconfig" and coll == "config.customers":
+                replace_string(json_file, '"n" : "', '"n" : "%s-' % (caseid))
     
 def find_paths(deps):
     '''
@@ -173,21 +187,60 @@ def get_avail_space(directory):
     '''
     Return the available space on the target directory where we will
     export the data.
+    Return the available disk space in MB
     :param directory: for which we want the disk space available.
     '''
-    # TODO
-    space = 0
-    return space
+    s = os.statvfs(directory)
+    df = (s.f_bavail * s.f_frsize) / (1024 * 1024)
+    if Verbose:
+        print "Space available on disk: %d MB" % (df)
+    return df
 
-def get_dbs_space(host, port):
+def get_dbs_space(mongoshell, host, port):
     '''
-    Calculate the space used by all DBs we want to export
+    Get the space used by all DBs we want to export
+    :param mongoshell: path to the mongoshell command.
     :param host: host where the DB is located.
     :param port: port to access the DB.
     '''
-    # TODO
-    space = 0
-    return space
+    dbs_space = 0
+    unexpected_dbs = []
+
+    # Get the list of DBs
+    cmd = "db.adminCommand('listDatabases').databases"
+    (_, out) = run_mongoshell_cmd(mongoshell, host, port, "test", cmd)
+    # Iterate through the DBs
+    # If MMS DB, add it, if not and big, warn that this may not work...
+    for one_line in out:
+        m = re.search(r'"name"\s*:\s*"(.+)"', one_line)
+        if m:
+            one_db = m.group(1)
+            identified_db = False
+            for ok_db in ALL_MMS_DBS:
+                if re.search(ok_db, one_db):
+                    # Add the space
+                    cmd = "db.stats().dataSize"
+                    (_, out) = run_mongoshell_cmd(mongoshell, host, port, one_db, cmd)   
+                    one_db_space = int(out[0].rstrip())/(1024*1024)     
+                    dbs_space += one_db_space     
+                    if Verbose:
+                        print "DB: %s, %d MB" % (one_db, one_db_space)
+                    identified_db = True
+                    break
+            for not_db in NOT_MMS_DBS:
+                if re.search(not_db, one_db):
+                    # Nothing to do with those
+                    identified_db = True
+                    break
+            if identified_db == False:
+                if Verbose:
+                    warning("Unexpected DB on the MMS server: %s" % (one_db))
+                unexpected_dbs.append(one_db)   
+                if len(unexpected_dbs) >= MAX_UNEXPECTED_DBS:
+                    fatal("Too many unexpected DBs, will not export unless you run with --nocheck\n  DBs: %s" % (unexpected_dbs,))         
+    if Verbose:
+        print "Space needed on disk: %d MB" % (dbs_space)
+    return dbs_space
 
 def get_mms_version(dump_dir):
     '''
@@ -207,7 +260,7 @@ def get_mms_version(dump_dir):
     # to figure out the version
     version = "1.0"
     migration_file = os.path.join(dump_dir, COLLECTIONS_DIR, "cloudconf", "app.migrations")
-    (ret, out) = run_cmd("wc -l %s" % (migration_file), array=False)
+    (ret, out) = run_cmd("wc -l %s" % (migration_file), array=False, norun=Norun)
     if not ret:
         items = out.split()
         count = items[0]
@@ -224,7 +277,6 @@ def get_mms_version(dump_dir):
         print "MMS version is %s" % (version)
     return version
     
-
 def package(directory, zipname):
     '''
     Create a Zip file of the data.
@@ -237,7 +289,7 @@ def package(directory, zipname):
     tar = tarfile.open(target, "w:gz")
     tar.add(os.path.join(directory, DUMPDIR))    
     tar.close()
-    print " done."
+    print "  done."
     return target
     
 def replace_string(filename, search_exp, replace_exp):
@@ -252,6 +304,23 @@ def replace_string(filename, search_exp, replace_exp):
             line = line.replace(search_exp, replace_exp)
         sys.stdout.write(line)
 
+def run_mongoshell_cmd(mongoshell, host, port, db, cmd, norun=Norun):
+    '''
+    Run a command in the Mongo shell and return the result as an
+    array of lines.
+    Unfortunately, this is to avoid using PyMongo, so the result
+    is unstructured and the caller must process the lines.
+    :param mongoshell: path to 'mongo' shell
+    :param host: host to connect to
+    :param port: port to connect to
+    :param db: db on which the command is ran
+    :param cmd: MongoDB shell command to run
+    :param norun: Optional parameter to not run the command, but
+                  just show what would be ran.
+    '''
+    mongoshell_cmd = "%s --quiet --host %s --port %s --eval \"printjson(%s)\" %s" % (mongoshell, host, port, cmd, db)
+    return(run_cmd(mongoshell_cmd, norun=norun))
+
 def ship(zipfile, caseid):
     '''
     scp the zip file to the MongoDB DropBox
@@ -261,35 +330,76 @@ def ship(zipfile, caseid):
     print "Preparing to upload to MongoDB Inc"
     print "  *** You will be prompted to enter a password, just press <enter> ***"
     print ""
-    cmd = 'scp -o "StrictHostKeyChecking no" -P 722 %s %s%d@www.mongodb.com:.' % (zipfile, FTP_PREFIX, caseid)
-    run_cmd(cmd, abort=True)
+    cmd = 'scp -o "StrictHostKeyChecking no" -P 722 %s %s%s@www.mongodb.com:.' % (zipfile, FTP_PREFIX, caseid)
+    run_cmd(cmd, abort=True, norun=Norun)
     os.remove(zipfile)
-    print " done."
+    print "  done."
+
+def doc_to_json(doc):
+    '''
+    Return a JSON string from a document.
+    The values are either string, or string representations of the types, this is
+    not a very intelligent function, it is just to avoid importing 'json' which
+    does not exists in Python 2.4
+    :param doc: string to transform in JSON
+    '''
+    doc_str = '{'
+    for key in doc.keys():
+        doc_str += ' "%s":%s,' % (key, doc[key])
+    if doc_str.endswith(','):
+        doc_str = doc_str[:-1]
+    doc_str += ' }'
+    return doc_str
+
+def write_import_data(dump_dir):
+    '''
+    Write some additional data regarding this export, so it can be tracked
+    and search in the target MMS database.
+    :param dump_dir: directory where to create the file with this info
+    '''
+    db_dir = os.path.join(dump_dir, COLLECTIONS_DIR, IMPORTER_DB)
+    if os.path.exists(db_dir):
+        shutil.rmtree(db_dir)
+    os.mkdir(db_dir)
+    doc = dict()
+    now = int(round(time.time() * 1000))
+    doc['ts'] = '{"$date":%d}' % (now)
+    doc['host'] = '"%s"' % (socket.gethostname())
+    if not Norun:
+        data_file = open(os.path.join(db_dir, "exports"), 'w')
+        data_file.write(doc_to_json(doc))
+        data_file.close()
     
 def write_mms_version(dump_dir):
     '''
     Write the MMS version in a file, so the importer knows how to import the data.
     :param dump_dir: dir under which the version file is saved.
     '''
-    mms_version = get_mms_version(dump_dir)
-    ver_file = open(os.path.join(dump_dir, MMS_VERSION_FILE),'w')
-    ver_file.write(mms_version)
-    ver_file.close()
+    if not Norun:
+        mms_version = get_mms_version(dump_dir)
+        ver_file = open(os.path.join(dump_dir, MMS_VERSION_FILE),'w')
+        ver_file.write(mms_version)
+        ver_file.close()
     
 def main():
     '''
     The main module.
     '''
-    global Verbose
     sys.stdout = flushfile(sys.stdout)
     (options, args) = get_opts()
     if args:
         fatal("Found trailing arguments: %s" % (str(args)))
     if options.verbose:
+        global Verbose
         Verbose = True
         print "Verbose mode on, will show more info..."
         print "%s version %s" % (TOOL, VERSION)
         print "Running Python version %s" % (sys.version)
+    if options.norun:
+        global Norun
+        Norun = True
+    if (options.ship or options.zip) and not options.caseid:
+        fatal("You must provide a '-caseid' in order to ship or create a shippable package")
     try:
         options.host = get_host(options.host)
         dump_dir = os.path.join(options.directory, DUMPDIR)
@@ -297,27 +407,32 @@ def main():
             if options.force:
                 shutil.rmtree(dump_dir)
             else:
-                fatal("You must remove manually the directory: %s" % (dump_dir))
+                fatal("You must use '--force' OR remove manually the directory: %s" % (dump_dir))
         paths = find_paths(DEPS)
-        space_needed = get_dbs_space(options.host, options.port)
-        space_avail = get_avail_space(options.directory)
-        # TODO - need a better formula, since we have the 'dump' dir and the 'gzip' files to create
-        if space_avail < space_needed:
-            print "Database is %d MBytes, there is only %s MBytes available on disk" % (space_needed/1000, space_avail/1000)
+        if not options.nocheck:
+            space_dbs = get_dbs_space(paths['mongo'], options.host, options.port)
+            space_avail = get_avail_space(options.directory)
+            # We need 1x for the data, 1x or less for the zip, and we give ourselves some margin
+            space_needed = space_dbs * 3
+            if space_avail < space_needed:
+                fatal("Export needs ~%d MBytes, there is only %d MBytes available on disk" % (space_needed, space_avail))
         dump_database(paths['mongodump'], options.host, options.port, options.directory)
         clean_dumped_data(dump_dir)
-        export_additional_data(paths['mongoexport'], options.host, options.port, dump_dir, options.ship)
+        export_additional_data(paths['mongoexport'], options.host, options.port, dump_dir, options.caseid)
         write_mms_version(dump_dir)
-
+        write_import_data(dump_dir)
         if options.ship:
-            zipfile = package(options.directory, str(options.ship))
-            ship(zipfile, options.ship)
+            zipfile = package(options.directory, options.caseid)
+            ship(zipfile, options.caseid)
         elif options.zip:
-            zipfile = package(options.directory, 'mongodb_mms_data')
+            zipfile = package(options.directory, options.caseid)
             
     except Exception, e:
         error("caught exception:\n  " + e.__str__())
     
+    if Errors:
+        print "The script terminated with errors"
+        
 # Common functions
 # Those are shared with 'mongommsimport', so changes here should be done
 # tested in the other script.
@@ -364,20 +479,30 @@ def get_host(hostname):
                 break    
     return hostname
 
-def run_cmd(cmd, array=True, abort=False):
+def run_cmd(cmd, array=True, abort=False, norun=False):
     '''
     Run a command in the shell and return the result as a string or list
     :param cmd: command to run
-    :param array: return result as array. 'True' is the default
+    :param array: optional, return result as array. 'True' is the default
+    :param abort: if True, abort the command if a failure occur
+    :param norun: don't run the command, just show what would be ran.
     '''
-    if Verbose:
-        print "Running CMD: ", cmd
-    (status, out) = commands.getstatusoutput(cmd)
-    if status:
-        if abort:
-            raise Exception("ERROR in running - " + cmd)
-    if array == True:
-        return status, out.split('\n')
+    if norun:
+        print "Would run CMD: ", cmd
+        status = 0
+        if array:
+            out = []
+        else:
+            out = ""
+    else:
+        if Verbose:
+            print "Running CMD: ", cmd
+        (status, out) = commands.getstatusoutput(cmd)
+        if status:
+            if abort:
+                raise Exception("ERROR in running - " + cmd)
+        if array == True:
+            return status, out.split('\n')
     return status, out
 
 # Utility classes
