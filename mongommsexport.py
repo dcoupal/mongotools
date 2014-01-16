@@ -117,6 +117,22 @@ def clean_dumped_data(directory):
                     fatal("That does not look like MMS database, missing collection: %s" % (file_to_rm))
                 os.remove(file_to_rm)
 
+def doc_to_json(doc):
+    '''
+    Return a JSON string from a document.
+    The values are either string, or string representations of the types, this is
+    not a very intelligent function, it is just to avoid importing 'json' which
+    does not exists in Python 2.4
+    :param doc: string to transform in JSON
+    '''
+    doc_str = '{'
+    for key in doc.keys():
+        doc_str += ' "%s":%s,' % (key, doc[key])
+    if doc_str.endswith(','):
+        doc_str = doc_str[:-1]
+    doc_str += ' }'
+    return doc_str
+
 def dump_database(mongodump, host, port, directory):
     '''
     Dump the database with "mongodump".
@@ -237,7 +253,7 @@ def get_dbs_space(mongoshell, host, port):
                     warning("Unexpected DB on the MMS server: %s" % (one_db))
                 unexpected_dbs.append(one_db)   
                 if len(unexpected_dbs) >= MAX_UNEXPECTED_DBS:
-                    fatal("Too many unexpected DBs, will not export unless you run with --nocheck\n  DBs: %s" % (unexpected_dbs,))         
+                    fatal("Too many unexpected DBs, will not export unless you run with --nocheck\n  unexpected DBs: %s" % (unexpected_dbs,))         
     if Verbose:
         print "Space needed on disk: %d MB" % (dbs_space)
     return dbs_space
@@ -321,6 +337,16 @@ def run_mongoshell_cmd(mongoshell, host, port, db, cmd, norun=Norun):
     mongoshell_cmd = "%s --quiet --host %s --port %s --eval \"printjson(%s)\" %s" % (mongoshell, host, port, cmd, db)
     return(run_cmd(mongoshell_cmd, norun=norun))
 
+def safe_rm_tree(directory):
+    '''
+    Just a wrapper on 'shutil.rmtree', to show that it is safe.
+    The script will ensure that we don't remove anything we should not
+    :param directory: directory to remove
+    '''
+    if not re.search(DUMPDIR, directory):
+        fatal("Unexpected directory to remove: %s" % (directory))
+    shutil.rmtree(directory)
+
 def ship(zipfile, caseid):
     '''
     scp the zip file to the MongoDB DropBox
@@ -335,22 +361,6 @@ def ship(zipfile, caseid):
     os.remove(zipfile)
     print "  done."
 
-def doc_to_json(doc):
-    '''
-    Return a JSON string from a document.
-    The values are either string, or string representations of the types, this is
-    not a very intelligent function, it is just to avoid importing 'json' which
-    does not exists in Python 2.4
-    :param doc: string to transform in JSON
-    '''
-    doc_str = '{'
-    for key in doc.keys():
-        doc_str += ' "%s":%s,' % (key, doc[key])
-    if doc_str.endswith(','):
-        doc_str = doc_str[:-1]
-    doc_str += ' }'
-    return doc_str
-
 def write_import_data(dump_dir):
     '''
     Write some additional data regarding this export, so it can be tracked
@@ -359,7 +369,7 @@ def write_import_data(dump_dir):
     '''
     db_dir = os.path.join(dump_dir, COLLECTIONS_DIR, IMPORTER_DB)
     if os.path.exists(db_dir):
-        shutil.rmtree(db_dir)
+        safe_rm_tree(db_dir)
     os.mkdir(db_dir)
     doc = dict()
     now = int(round(time.time() * 1000))
@@ -405,7 +415,7 @@ def main():
         dump_dir = os.path.join(options.directory, DUMPDIR)
         if os.path.exists(dump_dir):
             if options.force:
-                shutil.rmtree(dump_dir)
+                safe_rm_tree(dump_dir)
             else:
                 fatal("You must use '--force' OR remove manually the directory: %s" % (dump_dir))
         paths = find_paths(DEPS)
@@ -519,7 +529,6 @@ class flushfile(object):
 
 if __name__ == '__main__':
     main()
-
 
 
 

@@ -13,6 +13,9 @@ Script to restore an MMS instance.
   - restore the data with 'mongorestore' and 'mongoimport'
   - creates an entry about that restore, so we get the a trace of the import, the time, ...
   
+Instructions for using the tools are at:
+  https://wiki.mongodb.com/display/cs/MMS+Exporter+and+Importer
+  
 Pre-requisites:
   - Python < 2.3 and > 3.0
   - user must have 'mongo', 'mongoexport' and 'mongodump' in path, or set MONGO_HOME
