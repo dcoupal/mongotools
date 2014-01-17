@@ -28,15 +28,20 @@ Implementation details:
  TODOs
   - Add a security check, so the customers don't run this tool by mistake and import
     in their own database.
+  - add support for an authenticated MMS DB
 '''
 
 import bson
 import optparse
 import os
 import pymongo
+import re
 import shutil
+import socket
 import sys
 import tarfile
+import time
+import traceback
 
 ROOTDIR = os.path.dirname(__file__)
 sys.path.insert(0, ROOTDIR)
@@ -48,8 +53,7 @@ VERSION = "0.1.0"
 DEPS = [ "mongo", "mongoimport", "mongorestore" ]
 PID = os.getpid()
 
-COLLECTIONS_TO_IMPORT = [ ("mmsdbconfig", "config.customers"),
-                          ("importer", "exports") ] # IMPROVE, find all collections by looking at dir, except ("cloudconf", "app.migrations")
+COLLECTIONS_TO_IMPORT = [ ("mmsdbconfig", "config.customers"), mongommsexport.IMPORTER_LOGS ] # IMPROVE, find all collections by looking at dir, except ("cloudconf", "app.migrations")
 
 Verbose = False
 
@@ -63,8 +67,10 @@ def get_opts():
     group_general.add_option("-d", "--data", dest="data", type="string", default="", help="name of the .gzip file or directory to import", metavar="FILE")
     group_general.add_option("--host", dest="host", type="string", default='localhost', help="host name of the MMS server", metavar="HOST")
     group_general.add_option("-p", "--port", dest="port", type="string", default='27017', help="port of the MMS server", metavar="PORT")
+    group_general.add_option("--password", dest="password", type="string", default='', help="password for a secured MMS DB", metavar="PASSWORD")
     group_general.add_option("-t", "--tmpdir", dest="tmpdir", type="string", default=".", help="temporary dir to use for the restore", metavar="DIR")
     group_general.add_option("-u", "--upsert", dest="upsert", action="store_true", default=False, help="upsert/update the data that already exists")
+    group_general.add_option("--username", dest="username", type="string", default='', help="username for a secured MMS DB", metavar="USERNAME")
     group_general.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False, help="show more output")
     group_security = optparse.OptionGroup(parser, "Security options")
     parser.add_option_group(group_security)
@@ -72,6 +78,12 @@ def get_opts():
     (options, args) = parser.parse_args()
     return options, args
 
+def add_data(directory):
+    col_filepath = os.path.join(directory, mongommsexport.COLLECTIONS_DIR, mongommsexport.IMPORTER_LOGS[0], mongommsexport.IMPORTER_LOGS[1])
+    now = int(round(time.time() * 1000))
+    add_fields = '"import_host" = "%s", "import_ts" = {"$date":%d} }' % (socket.gethostname(), now)
+    mongommsexport.replace_string(col_filepath, r"}\s*$", add_fields)
+    
 def clean_data(directory):
     '''
     Remove the MMS config data
@@ -106,7 +118,7 @@ def get_data_mms_version(directory):
         version_file.close()
     return version
         
-def get_mms_version(host, port):
+def get_mms_version(auth_dict, host, port):
     '''
     Get the MMS version of the target instance.
     :param host: of the target MMS instance.
@@ -115,6 +127,8 @@ def get_mms_version(host, port):
     version = None
     int_port = int(port)
     client = pymongo.mongo_client.MongoClient(host=host, port=int_port)
+    if auth_dict is not None:
+        client['admin'].authenticate(auth_dict['username'], auth_dict['password'], source=auth_dict['auth_database'])
     # Ensure all aggregations, alerts, ... settings are turned off
     coll = 'app.migrations'
     if Verbose:
@@ -133,7 +147,7 @@ def get_mms_version(host, port):
         version = "1.1"
     return version
 
-def restore_database(host, port, directory, mongorestore, mongoimport, upsert):
+def restore_database(mongorestore, mongoimport, auth_string, host, port, directory, upsert):
     '''
     Load the MMS data into our target instance.
     :param host: of the target MMS instance
@@ -145,21 +159,21 @@ def restore_database(host, port, directory, mongorestore, mongoimport, upsert):
     '''
     print "Restoring database"
     print "  First, the 'dump' part..."
-    cmd = "%s --host %s --port %s --verbose" % (mongorestore, host, port)
+    cmd = "%s %s --host %s --port %s --verbose" % (mongorestore, auth_string, host, port)
     cmd = "cd %s && %s" % (directory, cmd)
     mongommsexport.run_cmd(cmd, abort=True)
     print "  Secondly, the exported collections..."
     for db_coll in COLLECTIONS_TO_IMPORT:
         (db, coll) = db_coll
         json_file = os.path.join(directory, mongommsexport.DUMPDIR, mongommsexport.COLLECTIONS_DIR, db, coll)
-        cmd = "%s --host %s --port %s -d %s -c %s --file %s" % (mongoimport, host, port, db, coll, json_file)
+        cmd = "%s %s --host %s --port %s -d %s -c %s --file %s" % (mongoimport, auth_string, host, port, db, coll, json_file)
         if upsert:
             cmd = cmd + " --upsert"
         mongommsexport.run_cmd(cmd, abort=True)
-    
+    # show groups being restored
     print "  done."
   
-def set_defaults(host, port, mms_version):
+def set_defaults(auth_dict, host, port, mms_version):
     '''
     Set/reset some default values and settings in the target database.
     For example:
@@ -172,24 +186,26 @@ def set_defaults(host, port, mms_version):
         print "Setting/resetting default values on MMS viewer instance"
     int_port = int(port)
     client = pymongo.mongo_client.MongoClient(host=host, port=int_port)
+    if auth_dict is not None:
+        client['admin'].authenticate(auth_dict['username'], auth_dict['password'], source=auth_dict['auth_database'])
     # Ensure all aggregations, alerts, ... settings are turned off
     coll = 'app.systemCronState'
     if Verbose:
-        print "Modifying DB:%s COLL:%s" % (mongommsexport.DB_CLOUDCONF, coll)
+        print "  Modifying DB:%s COLL:%s" % (mongommsexport.DB_CLOUDCONF, coll)
     db = client[mongommsexport.DB_CLOUDCONF]
     coll = db[coll]
     coll.update({},{"$set":{"enabled":False}}, upsert=False, multi=True)
     # Ensure specific alerts are turned off
     coll = 'config.alertSettings'
     if Verbose:
-        print "Modifying DB:%s COLL:%s" % (mongommsexport.DB_MMSCONF, coll)
+        print "  Modifying DB:%s COLL:%s" % (mongommsexport.DB_MMSCONF, coll)
     db = client[mongommsexport.DB_MMSCONF]
     coll = db[coll]
     coll.update({},{"$set":{"enabled":False}}, upsert=False, multi=True)
     # All our internal users should have access to all groups
     coll = 'config.users'
     if Verbose:
-        print "Modifying DB:%s COLL:%s" % (mongommsexport.DB_MMSCONF, coll)
+        print "  Modifying DB:%s COLL:%s" % (mongommsexport.DB_MMSCONF, coll)
     db = client[mongommsexport.DB_MMSCONF]
     coll = db[coll]
     if mms_version >= "1.3":
@@ -199,6 +215,16 @@ def set_defaults(host, port, mms_version):
         oid = bson.objectid.ObjectId(oid="4d09359b1cc223ebd7f9797f")
         coll.update({"pe":{"$regex":"mongodb.com"}}, {"$addToSet": {"cids":oid}, "$set":{"xe":True}}, upsert=False, multi=True)
 
+def show_imported_groups(extract_dir):
+    groups = []
+    coll_filepath = os.path.join(extract_dir, mongommsexport.DUMPDIR, mongommsexport.COLLECTIONS_DIR, mongommsexport.COLLECTION_WITH_GROUPS[0], mongommsexport.COLLECTION_WITH_GROUPS[1])
+    coll_file = open(coll_filepath)
+    for line in coll_file.readlines():
+        m = re.search(r'"n"\s*:\s*"(.+?)"', line)
+        if m:
+            groups.append(m.group(1))
+    print "Groups imported: %s" % (groups,)
+    
 def main():
     '''
     The main module.
@@ -214,20 +240,31 @@ def main():
         print "Verbose mode on, will show more info..."
         print "%s version %s" % (TOOL, VERSION)
         print "Running Python version %s" % (sys.version)
+    auth_string = ''
+    auth_dict = None
+    if options.username or options.password:
+        if not options.username or not options.password:
+            mongommsexport.fatal("You must provide both: --username and --password")
+        else:
+            auth_string = "--username %s --password %s --authenticationDatabase %s" % (options.username, options.password, mongommsexport.AUTH_DB)
+            auth_dict = dict()
+            auth_dict['username'] = options.username
+            auth_dict['password'] = options.password
+            auth_dict['auth_database'] = mongommsexport.AUTH_DB
     try:
         options.host = mongommsexport.get_host(options.host)
         paths = mongommsexport.find_paths(DEPS)
-        mms_version = get_mms_version(options.host, options.port)
+        mms_version = get_mms_version(auth_dict, options.host, options.port)
         if options.data:
             need_rm_extract_dir = False
             if not os.path.exists(options.data):
                 mongommsexport.fatal("Can't find gzip file or directory to import: %s" % (options.data))
             if os.path.isfile(options.data):
                 extract_dir = os.path.join(options.tmpdir, str(PID))
+                #need_rm_extract_dir = True
                 if os.path.exists(extract_dir):
                     mongommsexport.warning("Remove previously left over temp dir: %s" % (extract_dir))
                     shutil.rmtree(extract_dir)
-                    need_rm_extract_dir = True
                 explode_gzip(options.data, extract_dir)
             elif os.path.isdir(options.data):
                 # Assume the format and contents is already right
@@ -239,17 +276,24 @@ def main():
             if data_mms_version != mms_version:
                 mongommsexport.fatal("Can't import MMS data in version %s into a MMS server version %s" % (data_mms_version, mms_version))
             clean_data(dump_dir)
-            restore_database(options.host, options.port, extract_dir, paths['mongorestore'], paths['mongoimport'], options.upsert)
+            add_data(dump_dir)
+            restore_database(paths['mongorestore'], paths['mongoimport'], auth_string, options.host, options.port, extract_dir, options.upsert)
+            show_imported_groups(extract_dir)
             # Clean the dump tree
             if need_rm_extract_dir:
                 if Verbose:
                     print "Removing temp dump directory"
                 shutil.rmtree(extract_dir)
-        set_defaults(options.host, options.port, mms_version)
+        set_defaults(auth_dict, options.host, options.port, mms_version)
             
     except Exception, e:
         mongommsexport.error("caught exception:\n  " + e.__str__())
+        if Verbose:
+            traceback.print_exc()
+    if mongommsexport.Errors:
+        print "The script terminated with errors"
     
+         
 if __name__ == '__main__':
     main()
 

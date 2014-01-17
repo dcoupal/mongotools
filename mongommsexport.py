@@ -30,6 +30,8 @@ Implementation details:
   - because we are running 'mongodump', we don't have control on the DBs we
     are exporting. If users have more than MMS in the DB, we may export way 
     too much. Then we would need to export with 'mongoexport'
+  - add mongod credentials
+  - support Kerberos
 '''
 
 import commands
@@ -47,13 +49,14 @@ import time
 TOOL = "mongommsexport"
 VERSION = "0.1.0"
 
+AUTH_DB = "admin"
 COLLECTIONS_DIR = "_collections"
 DB_CLOUDCONF = "cloudconf"
 DB_MMSCONF = "mmsdbconfig"
 DEPS = ("mongo", "mongodump", "mongoexport")
 DUMPDIR = "dump"
 FTP_PREFIX = "MMS-"
-IMPORTER_DB = "importer"
+IMPORTER_LOGS = ("importer", "logs")
 MMS_VERSION_FILE = "mms_version"
 NUL_DOMAIN = "example.com"
 
@@ -66,6 +69,7 @@ FILES_TO_REMOVE = [
                    "mmsdblogs-*/*"
                    ]
 COLLECTIONS_TO_EXPORT = [ ("cloudconf", "app.migrations"), ("mmsdbconfig", "config.customers")  ]
+COLLECTION_WITH_GROUPS = ("mmsdbconfig", "config.customers")
 
 MAX_UNEXPECTED_DBS = 0
 ALL_MMS_DBS = [ r"^apiv3$", r"^alerts$", r"^cloudconf$", r"^mmsdb.*", r"^mongo-distributed-lock$" ]
@@ -95,7 +99,9 @@ def get_opts():
     parser.add_option_group(group_security)
     group_security.add_option("--nocheck", dest="nocheck", action="store_true", default=False, help="don't run any check, you must ensure you have enough space, ...")
     group_security.add_option("--norun", dest="norun", action="store_true", default=False, help="don't run any command, just show them")
+    group_security.add_option("--password", dest="password", type="string", default='', help="password for a secured MMS DB", metavar="PASSWORD")
     group_security.add_option("-s", "--ship", dest="ship", action="store_true", default=False, help="ship the data under the given '-caseid' number")
+    group_security.add_option("--username", dest="username", type="string", default='', help="username for a secured MMS DB", metavar="USERNAME")
     group_security.add_option("-z", "--zip", dest="zip", action="store_true", default=False, help="zip the data, but do not ship it")
     (options, args) = parser.parse_args()
     return options, args
@@ -133,7 +139,7 @@ def doc_to_json(doc):
     doc_str += ' }'
     return doc_str
 
-def dump_database(mongodump, host, port, directory):
+def dump_database(mongodump, auth_string, host, port, directory):
     '''
     Dump the database with "mongodump".
     :param mongodump: path to the executable mongodump.
@@ -142,13 +148,13 @@ def dump_database(mongodump, host, port, directory):
     :param directory: directory where to dump to database.
     '''
     print "Dumping database...",
-    cmd = "%s --host %s --port %s" % (mongodump, host, port)
+    cmd = "%s %s --host %s --port %s" % (mongodump, auth_string, host, port)
     if directory != ".":
         cmd = "cd %s && %s" % (directory, cmd)
     run_cmd(cmd, abort=True, norun=Norun)
     print "  done."
     
-def export_additional_data(mongoexport, host, port, dump_dir, caseid):
+def export_additional_data(mongoexport, auth_string, host, port, dump_dir, caseid):
     '''
     Export additional data.
     Add "text" version of some collections, to make it easier for the
@@ -165,40 +171,13 @@ def export_additional_data(mongoexport, host, port, dump_dir, caseid):
     for db_coll in COLLECTIONS_TO_EXPORT:
         (db, coll) = db_coll
         json_file = os.path.join(dump_dir, COLLECTIONS_DIR, db, coll)
-        cmd = "%s --host %s --port %s -d %s -c %s -o %s" % (mongoexport, host, port, db, coll, json_file)
+        cmd = "%s %s --host %s --port %s -d %s -c %s -o %s" % (mongoexport, auth_string, host, port, db, coll, json_file)
         run_cmd(cmd, norun=Norun)
         # Modify the customer group names, so they have the case ID as a prefix
         if not Norun:
-            if db == "mmsdbconfig" and coll == "config.customers":
+            if db == COLLECTION_WITH_GROUPS[0] and coll == COLLECTION_WITH_GROUPS[1]:
                 replace_string(json_file, '"n" : "', '"n" : "%s-' % (caseid))
     
-def find_paths(deps):
-    '''
-    Find the paths of all MongoDB tools we need to export the DB.
-    :param deps: list of all the tools we depend on and want to resolve
-                 to full paths.
-    '''
-    paths = dict()
-    errors = 0
-    MONGO_HOME = 'MONGO_HOME'
-    for one_dep in deps:
-        if os.environ.get(MONGO_HOME):
-            dep = os.path.join(os.environ.get(MONGO_HOME), 'bin', one_dep)
-        else:
-            dep = one_dep
-        cmd = dep + " --version"
-        (ret, out) = run_cmd(cmd)
-        if ret:
-            errors += 1
-            error("can't find %s, you can add it to your path or set %s" % (dep, MONGO_HOME))
-        else:
-            if Verbose:
-                print "Found %s" % (out)
-            paths[one_dep] = dep
-    if errors:
-        fatal("aborting...")
-    return paths
-
 def get_avail_space(directory):
     '''
     Return the available space on the target directory where we will
@@ -212,7 +191,7 @@ def get_avail_space(directory):
         print "Space available on disk: %d MB" % (df)
     return df
 
-def get_dbs_space(mongoshell, host, port):
+def get_dbs_space(mongoshell, auth_string, host, port):
     '''
     Get the space used by all DBs we want to export
     :param mongoshell: path to the mongoshell command.
@@ -224,7 +203,7 @@ def get_dbs_space(mongoshell, host, port):
 
     # Get the list of DBs
     cmd = "db.adminCommand('listDatabases').databases"
-    (_, out) = run_mongoshell_cmd(mongoshell, host, port, "test", cmd)
+    (_, out) = run_mongoshell_cmd(mongoshell, auth_string, host, port, "test", cmd)
     # Iterate through the DBs
     # If MMS DB, add it, if not and big, warn that this may not work...
     for one_line in out:
@@ -236,7 +215,7 @@ def get_dbs_space(mongoshell, host, port):
                 if re.search(ok_db, one_db):
                     # Add the space
                     cmd = "db.stats().dataSize"
-                    (_, out) = run_mongoshell_cmd(mongoshell, host, port, one_db, cmd)   
+                    (_, out) = run_mongoshell_cmd(mongoshell, auth_string, host, port, one_db, cmd)   
                     one_db_space = int(out[0].rstrip())/(1024*1024)     
                     dbs_space += one_db_space     
                     if Verbose:
@@ -308,19 +287,7 @@ def package(directory, zipname):
     print "  done."
     return target
     
-def replace_string(filename, search_exp, replace_exp):
-    '''
-    Utility to replace a string in a file.
-    :param filename: file to modify
-    :param search_exp: string to be replaced
-    :param replace_exp: replacement string
-    '''
-    for line in fileinput.input(filename, inplace=1):
-        if search_exp in line:
-            line = line.replace(search_exp, replace_exp)
-        sys.stdout.write(line)
-
-def run_mongoshell_cmd(mongoshell, host, port, db, cmd, norun=Norun):
+def run_mongoshell_cmd(mongoshell, auth_string, host, port, db, cmd, norun=Norun):
     '''
     Run a command in the Mongo shell and return the result as an
     array of lines.
@@ -334,7 +301,7 @@ def run_mongoshell_cmd(mongoshell, host, port, db, cmd, norun=Norun):
     :param norun: Optional parameter to not run the command, but
                   just show what would be ran.
     '''
-    mongoshell_cmd = "%s --quiet --host %s --port %s --eval \"printjson(%s)\" %s" % (mongoshell, host, port, cmd, db)
+    mongoshell_cmd = "%s %s --quiet --host %s --port %s --eval \"printjson(%s)\" %s" % (mongoshell, auth_string, host, port, cmd, db)
     return(run_cmd(mongoshell_cmd, norun=norun))
 
 def safe_rm_tree(directory):
@@ -367,16 +334,16 @@ def write_import_data(dump_dir):
     and search in the target MMS database.
     :param dump_dir: directory where to create the file with this info
     '''
-    db_dir = os.path.join(dump_dir, COLLECTIONS_DIR, IMPORTER_DB)
+    db_dir = os.path.join(dump_dir, COLLECTIONS_DIR, IMPORTER_LOGS[0])
     if os.path.exists(db_dir):
         safe_rm_tree(db_dir)
     os.mkdir(db_dir)
     doc = dict()
     now = int(round(time.time() * 1000))
-    doc['ts'] = '{"$date":%d}' % (now)
-    doc['host'] = '"%s"' % (socket.gethostname())
+    doc['export_ts'] = '{"$date":%d}' % (now)
+    doc['export_host'] = '"%s"' % (socket.gethostname())
     if not Norun:
-        data_file = open(os.path.join(db_dir, "exports"), 'w')
+        data_file = open(os.path.join(db_dir, IMPORTER_LOGS[1]), 'w')
         data_file.write(doc_to_json(doc))
         data_file.close()
     
@@ -410,6 +377,12 @@ def main():
         Norun = True
     if (options.ship or options.zip) and not options.caseid:
         fatal("You must provide a '-caseid' in order to ship or create a shippable package")
+    auth_string = ''
+    if options.username or options.password:
+        if not options.username or not options.password:
+            fatal("You must provide both: --username and --password")
+        else:
+            auth_string = "--username %s --password %s --authenticationDatabase %s" % (options.username, options.password, AUTH_DB)
     try:
         options.host = get_host(options.host)
         dump_dir = os.path.join(options.directory, DUMPDIR)
@@ -420,15 +393,15 @@ def main():
                 fatal("You must use '--force' OR remove manually the directory: %s" % (dump_dir))
         paths = find_paths(DEPS)
         if not options.nocheck:
-            space_dbs = get_dbs_space(paths['mongo'], options.host, options.port)
+            space_dbs = get_dbs_space(paths['mongo'], auth_string, options.host, options.port)
             space_avail = get_avail_space(options.directory)
             # We need 1x for the data, 1x or less for the zip, and we give ourselves some margin
             space_needed = space_dbs * 3
             if space_avail < space_needed:
                 fatal("Export needs ~%d MBytes, there is only %d MBytes available on disk" % (space_needed, space_avail))
-        dump_database(paths['mongodump'], options.host, options.port, options.directory)
+        dump_database(paths['mongodump'], auth_string, options.host, options.port, options.directory)
         clean_dumped_data(dump_dir)
-        export_additional_data(paths['mongoexport'], options.host, options.port, dump_dir, options.caseid)
+        export_additional_data(paths['mongoexport'], auth_string, options.host, options.port, dump_dir, options.caseid)
         write_mms_version(dump_dir)
         write_import_data(dump_dir)
         if options.ship:
@@ -439,7 +412,6 @@ def main():
             
     except Exception, e:
         error("caught exception:\n  " + e.__str__())
-    
     if Errors:
         print "The script terminated with errors"
         
@@ -474,6 +446,33 @@ def warning(mes):
     print "WARNING - %s" % (mes)
     return
 
+def find_paths(deps):
+    '''
+    Find the paths of all MongoDB tools we need to export the DB.
+    :param deps: list of all the tools we depend on and want to resolve
+                 to full paths.
+    '''
+    paths = dict()
+    errors = 0
+    MONGO_HOME = 'MONGO_HOME'
+    for one_dep in deps:
+        if os.environ.get(MONGO_HOME):
+            dep = os.path.join(os.environ.get(MONGO_HOME), 'bin', one_dep)
+        else:
+            dep = one_dep
+        cmd = dep + " --version"
+        (ret, out) = run_cmd(cmd)
+        if ret:
+            errors += 1
+            error("can't find %s, you can add it to your path or set %s" % (dep, MONGO_HOME))
+        else:
+            if Verbose:
+                print "Found %s" % (out)
+            paths[one_dep] = dep
+    if errors:
+        fatal("aborting...")
+    return paths
+
 def get_host(hostname):
     '''
     Utility function to look into your local hosts file to see
@@ -488,6 +487,18 @@ def get_host(hostname):
                 hostname = items[1]
                 break    
     return hostname
+
+def replace_string(filename, search_exp, replace_exp):
+    '''
+    Utility to replace a string in a file.
+    :param filename: file to modify
+    :param search_exp: string to be replaced
+    :param replace_exp: replacement string
+    '''
+    for line in fileinput.input(filename, inplace=1):
+        if search_exp in line:
+            line = line.replace(search_exp, replace_exp)
+        sys.stdout.write(line)
 
 def run_cmd(cmd, array=True, abort=False, norun=False):
     '''
@@ -510,7 +521,7 @@ def run_cmd(cmd, array=True, abort=False, norun=False):
         (status, out) = commands.getstatusoutput(cmd)
         if status:
             if abort:
-                raise Exception("ERROR in running - " + cmd)
+                raise Exception("ERROR in running - " + cmd + out)
         if array == True:
             return status, out.split('\n')
     return status, out
