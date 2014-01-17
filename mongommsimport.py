@@ -78,11 +78,17 @@ def get_opts():
     (options, args) = parser.parse_args()
     return options, args
 
-def add_data(directory):
+def add_data(directory, groups):
     col_filepath = os.path.join(directory, mongommsexport.COLLECTIONS_DIR, mongommsexport.IMPORTER_LOGS[0], mongommsexport.IMPORTER_LOGS[1])
     now = int(round(time.time() * 1000))
-    add_fields = '"import_host" = "%s", "import_ts" = {"$date":%d} }' % (socket.gethostname(), now)
-    mongommsexport.replace_string(col_filepath, r"}\s*$", add_fields)
+    groups_string = "["
+    for one_group in groups:
+        groups_string += '"%s",' % (one_group)
+    if groups_string.endswith(","):
+        groups_string = groups_string[:-1]
+    groups_string += "]"
+    add_fields = ', "import_host":"%s", "import_ts":{"$date":%d}, "groups":%s' % (socket.gethostname(), now, groups_string)
+    mongommsexport.replace_string(col_filepath, "}\n", add_fields + "}\n")
     
 def clean_data(directory):
     '''
@@ -224,7 +230,8 @@ def show_imported_groups(extract_dir):
         if m:
             groups.append(m.group(1))
     print "Groups imported: %s" % (groups,)
-    
+    return sorted(groups)
+
 def main():
     '''
     The main module.
@@ -275,10 +282,10 @@ def main():
             data_mms_version = get_data_mms_version(dump_dir)
             if data_mms_version != mms_version:
                 mongommsexport.fatal("Can't import MMS data in version %s into a MMS server version %s" % (data_mms_version, mms_version))
+            groups = show_imported_groups(extract_dir)
             clean_data(dump_dir)
-            add_data(dump_dir)
+            add_data(dump_dir, groups)
             restore_database(paths['mongorestore'], paths['mongoimport'], auth_string, options.host, options.port, extract_dir, options.upsert)
-            show_imported_groups(extract_dir)
             # Clean the dump tree
             if need_rm_extract_dir:
                 if Verbose:

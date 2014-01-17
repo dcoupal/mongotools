@@ -344,7 +344,7 @@ def write_import_data(dump_dir):
     doc['export_host'] = '"%s"' % (socket.gethostname())
     if not Norun:
         data_file = open(os.path.join(db_dir, IMPORTER_LOGS[1]), 'w')
-        data_file.write(doc_to_json(doc))
+        data_file.write(doc_to_json(doc) + "\n")
         data_file.close()
     
 def write_mms_version(dump_dir):
