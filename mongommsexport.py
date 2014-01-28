@@ -72,8 +72,8 @@ COLLECTIONS_TO_EXPORT = [ ("cloudconf", "app.migrations"), ("mmsdbconfig", "conf
 COLLECTION_WITH_GROUPS = ("mmsdbconfig", "config.customers")
 
 MAX_UNEXPECTED_DBS = 0
-ALL_MMS_DBS = [ r"^apiv3$", r"^alerts$", r"^cloudconf$", r"^mmsdb.*", r"^mongo-distributed-lock$" ]
-NOT_MMS_DBS = [ r"^config$", r"^local$", r"^test$" ]
+ALL_MMS_DBS = [ r"^apiv3$", r"^alerts$", r"^cloudconf$", r"^importer", r"^mmsdb.*", r"^mongo-distributed-lock$" ]
+NOT_MMS_DBS = [ r"^admin", r"^config$", r"^local$", r"^test$" ]
 
 # OS - specific?
 HOSTS_FILE = "/etc/hosts"
