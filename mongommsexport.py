@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 '''
 Created in January 2014
@@ -72,6 +72,7 @@ COLLECTIONS_TO_EXPORT = [ ("cloudconf", "app.migrations"), ("mmsdbconfig", "conf
 COLLECTION_WITH_GROUPS = ("mmsdbconfig", "config.customers")
 
 MAX_UNEXPECTED_DBS = 0
+MIN_EXPECTED_DBS = 14
 ALL_MMS_DBS = [ r"^apiv3$", r"^alerts$", r"^cloudconf$", r"^importer", r"^mmsdb.*", r"^mongo-distributed-lock$" ]
 NOT_MMS_DBS = [ r"^admin", r"^config$", r"^local$", r"^test$" ]
 
@@ -206,6 +207,7 @@ def get_dbs_space(mongoshell, auth_string, host, port):
     (_, out) = run_mongoshell_cmd(mongoshell, auth_string, host, port, "test", cmd)
     # Iterate through the DBs
     # If MMS DB, add it, if not and big, warn that this may not work...
+    mms_dbs = 0
     for one_line in out:
         m = re.search(r'"name"\s*:\s*"(.+)"', one_line)
         if m:
@@ -221,6 +223,7 @@ def get_dbs_space(mongoshell, auth_string, host, port):
                     if Verbose:
                         print "DB: %s, %d MB" % (one_db, one_db_space)
                     identified_db = True
+                    mms_dbs += 1
                     break
             for not_db in NOT_MMS_DBS:
                 if re.search(not_db, one_db):
@@ -233,6 +236,8 @@ def get_dbs_space(mongoshell, auth_string, host, port):
                 unexpected_dbs.append(one_db)   
                 if len(unexpected_dbs) >= MAX_UNEXPECTED_DBS:
                     fatal("Too many unexpected DBs, will not export unless you run with --nocheck\n  unexpected DBs: %s" % (unexpected_dbs,))         
+    if mms_dbs < MIN_EXPECTED_DBS:
+        fatal("Did not encountered enough MMS databases. If you are sure it is a good DB, you can re-run with the --nocheck option")
     if Verbose:
         print "Space needed on disk: %d MB" % (dbs_space)
     return dbs_space
