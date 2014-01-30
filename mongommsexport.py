@@ -33,7 +33,7 @@ Implementation details:
   - add mongod credentials
   - support Kerberos
 '''
-
+    
 import commands
 import fileinput
 import glob
@@ -45,6 +45,7 @@ import socket
 import sys
 import tarfile
 import time
+import traceback
 
 TOOL = "mongommsexport"
 VERSION = "0.1.0"
@@ -57,6 +58,7 @@ DEPS = ("mongo", "mongodump", "mongoexport")
 DUMPDIR = "dump"
 FTP_PREFIX = "MMS-"
 IMPORTER_LOGS = ("importer", "logs")
+MIN_DISK_SPACE = 3000
 MMS_VERSION_FILE = "mms_version"
 NUL_DOMAIN = "example.com"
 
@@ -74,7 +76,7 @@ COLLECTION_WITH_GROUPS = ("mmsdbconfig", "config.customers")
 MAX_UNEXPECTED_DBS = 0
 MIN_EXPECTED_DBS = 14
 ALL_MMS_DBS = [ r"^apiv3$", r"^alerts$", r"^cloudconf$", r"^importer", r"^mmsdb.*", r"^mongo-distributed-lock$" ]
-NOT_MMS_DBS = [ r"^admin", r"^config$", r"^local$", r"^test$" ]
+IGNORE_DBS = [ r"^admin", r"^config$", r"^local$", r"^test$" ]
 
 # OS - specific?
 HOSTS_FILE = "/etc/hosts"
@@ -225,7 +227,7 @@ def get_dbs_space(mongoshell, auth_string, host, port):
                     identified_db = True
                     mms_dbs += 1
                     break
-            for not_db in NOT_MMS_DBS:
+            for not_db in IGNORE_DBS:
                 if re.search(not_db, one_db):
                     # Nothing to do with those
                     identified_db = True
@@ -239,7 +241,7 @@ def get_dbs_space(mongoshell, auth_string, host, port):
     if mms_dbs < MIN_EXPECTED_DBS:
         fatal("Did not encountered enough MMS databases. If you are sure it is a good DB, you can re-run with the --nocheck option")
     if Verbose:
-        print "Space needed on disk: %d MB" % (dbs_space)
+        print "Databases space on disk: %d MB" % (dbs_space)
     return dbs_space
 
 def get_mms_version(dump_dir):
@@ -367,6 +369,8 @@ def main():
     '''
     The main module.
     '''
+    if os.name == 'nt':
+        fatal("This script has not been ported on Windows yet. It runs on Linux and Mac")
     sys.stdout = flushfile(sys.stdout)
     (options, args) = get_opts()
     if args:
@@ -398,12 +402,14 @@ def main():
                 fatal("You must use '--force' OR remove manually the directory: %s" % (dump_dir))
         paths = find_paths(DEPS)
         if not options.nocheck:
-            space_dbs = get_dbs_space(paths['mongo'], auth_string, options.host, options.port)
             space_avail = get_avail_space(options.directory)
+            if space_avail < MIN_DISK_SPACE:
+                fatal("Disk should have at least ~%d MBytes free, there is only %d MBytes available on disk" % (MIN_DISK_SPACE, space_avail))
+            space_dbs = get_dbs_space(paths['mongo'], auth_string, options.host, options.port)
             # We need 1x for the data, 1x or less for the zip, and we give ourselves some margin
             space_needed = space_dbs * 3
             if space_avail < space_needed:
-                fatal("Export needs ~%d MBytes, there is only %d MBytes available on disk" % (space_needed, space_avail))
+                fatal("Export needs ~%d MBytes free, there is only %d MBytes available on disk" % (space_needed, space_avail))
         dump_database(paths['mongodump'], auth_string, options.host, options.port, options.directory)
         clean_dumped_data(dump_dir)
         export_additional_data(paths['mongoexport'], auth_string, options.host, options.port, dump_dir, options.caseid)
@@ -416,9 +422,12 @@ def main():
             zipfile = package(options.directory, options.caseid)
             
     except Exception, e:
-        error("caught exception:\n  " + e.__str__())
+        error("caught exception:\n")
+        traceback.print_exc()
     if Errors:
         print "The script terminated with errors"
+    else:
+        print "Done."
         
 # Common functions
 # Those are shared with 'mongommsimport', so changes here should be done
@@ -430,7 +439,7 @@ def error(mes):
     '''
     global Errors
     Errors += 1
-    print "ERROR - %s" % (mes)
+    print "\nERROR - %s" % (mes)
     return
 
 def fatal(mes):
@@ -440,7 +449,7 @@ def fatal(mes):
     '''
     global Errors
     Errors += 1
-    print "FATAL - %s" % (mes)
+    print "\nFATAL - %s" % (mes)
     os.sys.exit(100)
 
 def warning(mes):
@@ -522,11 +531,11 @@ def run_cmd(cmd, array=True, abort=False, norun=False):
             out = ""
     else:
         if Verbose:
-            print "Running CMD: ", cmd
+            print "Running CMD: %s" % (cmd)
         (status, out) = commands.getstatusoutput(cmd)
         if status:
             if abort:
-                raise Exception("ERROR in running - " + cmd + out)
+                raise Exception("ERROR in running - %s\n%s" % (cmd, out))
         if array == True:
             return status, out.split('\n')
     return status, out
