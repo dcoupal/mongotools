@@ -175,7 +175,7 @@ def export_additional_data(mongoexport, auth_string, host, port, dump_dir, casei
         (db, coll) = db_coll
         json_file = os.path.join(dump_dir, COLLECTIONS_DIR, db, coll)
         cmd = "%s %s --host %s --port %s -d %s -c %s -o %s" % (mongoexport, auth_string, host, port, db, coll, json_file)
-        run_cmd(cmd, norun=Norun)
+        run_cmd(cmd, norun=Norun, abort=True)
         # Modify the customer group names, so they have the case ID as a prefix
         if not Norun:
             if db == COLLECTION_WITH_GROUPS[0] and coll == COLLECTION_WITH_GROUPS[1]:
@@ -262,7 +262,7 @@ def get_mms_version(dump_dir):
     # to figure out the version
     version = "1.0"
     migration_file = os.path.join(dump_dir, COLLECTIONS_DIR, "cloudconf", "app.migrations")
-    (ret, out) = run_cmd("wc -l %s" % (migration_file), array=False, norun=Norun)
+    (ret, out) = run_cmd("wc -l %s" % (migration_file), array=False, norun=Norun, abort=True)
     if not ret:
         items = out.split()
         count = items[0]
@@ -309,7 +309,16 @@ def run_mongoshell_cmd(mongoshell, auth_string, host, port, db, cmd, norun=Norun
                   just show what would be ran.
     '''
     mongoshell_cmd = "%s %s --quiet --host %s --port %s --eval \"printjson(%s)\" %s" % (mongoshell, auth_string, host, port, cmd, db)
-    return(run_cmd(mongoshell_cmd, norun=norun))
+    status, out = run_cmd(mongoshell_cmd, norun=norun, abort=True)
+    # Work around an issue when bad authentication returns 0
+    if not auth_string:
+        if type(out) is str and out == "undefined":
+            status = 1
+            raise Exception("ERROR in running - %s\n%s" % (mongoshell_cmd, out))        
+        elif len(out) > 0 and out[0] == "undefined":
+            status = 1
+            raise Exception("ERROR in running - %s\n%s" % (mongoshell_cmd, out[0]))
+    return status, out
 
 def safe_rm_tree(directory):
     '''
@@ -533,7 +542,7 @@ def run_cmd(cmd, array=True, abort=False, norun=False):
         if Verbose:
             print "Running CMD: %s" % (cmd)
         (status, out) = commands.getstatusoutput(cmd)
-        if status:
+        if status != 0:
             if abort:
                 raise Exception("ERROR in running - %s\n%s" % (cmd, out))
         if array == True:
