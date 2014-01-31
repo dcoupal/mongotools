@@ -47,7 +47,7 @@ import tarfile
 import time
 import traceback
 
-TOOL = "mongommsexport"
+TOOL = "mongo_mms_export"
 VERSION = "0.1.0"
 
 AUTH_DB = "admin"
@@ -439,7 +439,7 @@ def main():
         print "Done."
         
 # Common functions
-# Those are shared with 'mongommsimport', so changes here should be done
+# Those are shared with 'mongo_mms_import', so changes here should be done
 # tested in the other script.
 def error(mes):
     '''
