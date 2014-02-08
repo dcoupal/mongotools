@@ -27,10 +27,6 @@ Implementation details:
     agent in Python will be replaced by a Go version.
     
  TODOs
-  - because we are running 'mongodump', we don't have control on the DBs we
-    are exporting. If users have more than MMS in the DB, we may export way 
-    too much. Then we would need to export with 'mongoexport'
-  - add mongod credentials
   - support Kerberos
 '''
     
@@ -314,10 +310,10 @@ def run_mongoshell_cmd(mongoshell, auth_string, host, port, db, cmd, norun=Norun
     if not auth_string:
         if type(out) is str and out == "undefined":
             status = 1
-            raise Exception("ERROR in running - %s\n%s" % (mongoshell_cmd, out))        
+            raise AuthException("ERROR in running - %s\n%s" % (mongoshell_cmd, out))        
         elif len(out) > 0 and out[0] == "undefined":
             status = 1
-            raise Exception("ERROR in running - %s\n%s" % (mongoshell_cmd, out[0]))
+            raise AuthException("ERROR in running - %s\n%s" % (mongoshell_cmd, out[0]))
     return status, out
 
 def safe_rm_tree(directory):
@@ -344,7 +340,7 @@ def ship(zipfile, caseid):
     os.remove(zipfile)
     print "  done."
 
-def write_import_data(dump_dir):
+def write_import_data(dump_dir, case_id):
     '''
     Write some additional data regarding this export, so it can be tracked
     and search in the target MMS database.
@@ -358,6 +354,7 @@ def write_import_data(dump_dir):
     now = int(round(time.time() * 1000))
     doc['export_ts'] = '{"$date":%d}' % (now)
     doc['export_host'] = '"%s"' % (socket.gethostname())
+    doc['case_id'] = case_id
     if not Norun:
         data_file = open(os.path.join(db_dir, IMPORTER_LOGS[1]), 'w')
         data_file.write(doc_to_json(doc) + "\n")
@@ -423,18 +420,22 @@ def main():
         clean_dumped_data(dump_dir)
         export_additional_data(paths['mongoexport'], auth_string, options.host, options.port, dump_dir, options.caseid)
         write_mms_version(dump_dir)
-        write_import_data(dump_dir)
+        write_import_data(dump_dir, options.caseid)
         if options.ship:
             zipfile = package(options.directory, options.caseid)
             ship(zipfile, options.caseid)
         elif options.zip:
             zipfile = package(options.directory, options.caseid)
             
+    except AuthException, e:
+        error("caught authentication exception:\n" + 
+              "You may need to run this script with --user and --password options\n")
+        traceback.print_exc()
     except Exception, e:
         error("caught exception:\n")
         traceback.print_exc()
     if Errors:
-        print "The script terminated with errors"
+        print "\nThe script terminated with errors"
     else:
         print "Done."
         
@@ -560,6 +561,9 @@ class flushfile(object):
     def write(self, x):
         self.f.write(x)
         self.f.flush()
+
+class AuthException(Exception):
+    pass
 
 if __name__ == '__main__':
     main()
